@@ -66,6 +66,7 @@ jobs:
         with:
           name: web-dist
           path: web/out
+          retention-days: 3
 
   # ② 五平台交叉编译（内嵌前端）+ 打 zip
   binaries:
@@ -112,12 +113,14 @@ jobs:
         with:
           name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
           path: "dist/*.zip"
+          retention-days: 3
       # Linux 生二进制单独上传，供 docker job 复用（免在镜像里重编前端+Go）
       - if: matrix.goos == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: bin-linux-${{ matrix.goarch }}
           path: dist/artex-linux-${{ matrix.goarch }}/artex
+          retention-days: 3
 
   # ③ 汇总所有 zip → 创建 GitHub Release
   release:
@@ -283,3 +286,40 @@ jobs:
             "$IMAGE:$RELEASE_TAG-amd64" "$IMAGE:$RELEASE_TAG-arm64"
           docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --raw > /tmp/artex-manifest.json
           jq -e '[.manifests[].platform | select(.os == "linux") | .architecture] | index("amd64") != null and index("arm64") != null' /tmp/artex-manifest.json
+
+  # ⑥ 每次构建完成后，清理同仓库早期 artifacts，防止占满 0.5 GB 配额
+  cleanup-artifacts:
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Delete old artifacts, keep latest 5 per name
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          artifacts=$(gh api repos/${{ github.repository }}/actions/artifacts --jq '.artifacts[] | {id, name, size_in_bytes, created_at} | @json')
+          declare -A latest
+          while IFS= read -r line; do
+            id=$(echo "$line" | jq -r .id)
+            name=$(echo "$line" | jq -r .name)
+            size=$(echo "$line" | jq -r .size_in_bytes)
+            ts=$(echo "$line" | jq -r .created_at)
+            if [[ -z "${latest[$name]:-}" || "$ts" > "${latest[$name]%%:*}" ]]; then
+              latest[$name]="$ts:$id"
+            fi
+          done <<< "$artifacts"
+
+          while IFS= read -r line; do
+            id=$(echo "$line" | jq -r .id)
+            name=$(echo "$line" | jq -r .name)
+            size=$(echo "$line" | jq -r .size_in_bytes)
+            keep=false
+            for n in "${!latest[@]}"; do
+              if [[ "${latest[$n]#*:}" == "$id" ]]; then keep=true; break; fi
+            done
+            if [[ "$keep" == "false" ]]; then
+              echo "Deleting artifact $id ($name, $size bytes)"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" >/dev/null 2>&1 || true
+            fi
+          done <<< "$artifacts"
